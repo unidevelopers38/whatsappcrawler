@@ -285,11 +285,20 @@ app.get('/chats/:clientId', async (req, res) => {
                 
                 let contactInfo = {};
                 if (!chat.isGroup) {
-                    const contact = await client.getContactById(chat.id._serialized);
-                    contactInfo = {
-                        name: contact.name || contact.pushname || '',
-                        number: contact.number || ''
-                    };
+                    try {
+                        const contact = await client.getContactById(chat.id._serialized);
+                        contactInfo = {
+                            name: contact.name || contact.pushname || '',
+                            number: contact.number || ''
+                        };
+                    } catch (contactError) {
+                        // Fallback to chat data when contact lookup fails
+                        const phoneNumber = chat.id.user; // Extract number from ID like "123456789@c.us"
+                        contactInfo = {
+                            name: chat.name || chat.pushname || phoneNumber,
+                            number: phoneNumber
+                        };
+                    }
                 }
                 
                 return {
@@ -336,7 +345,6 @@ app.get('/chats/:clientId', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
-
 // 6. Get Messages for a Specific Chat
 app.get('/chats/:clientId/:chatId/messages', async (req, res) => {
     const { clientId, chatId } = req.params;
@@ -408,6 +416,76 @@ app.post('/chats/:clientId/:chatId/send', async (req, res) => {
         res.json({ success: true, chatId });
     } catch (err) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+// Add this endpoint to your Node.js service
+app.post('/message/send-bulk', async (req, res) => {
+    const { clientId, recipients, message, delay = 0 } = req.body;
+    const client = clients[clientId];
+
+    if (!client || client.status !== 'ready') {
+        return res.status(400).json({ error: "Client not ready" });
+    }
+
+    if (!Array.isArray(recipients) || recipients.length === 0) {
+        return res.status(400).json({ error: "Invalid recipients array" });
+    }
+
+    const results = [];
+    const errors = [];
+
+    try {
+        for (let i = 0; i < recipients.length; i++) {
+            const recipient = recipients[i];
+            
+            try {
+                // Send message
+                await client.sendMessage(recipient, message);
+                results.push({
+                    recipient,
+                    status: 'success',
+                    index: i
+                });
+                
+                // Add delay between messages
+                if (delay > 0 && i < recipients.length - 1) {
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+                
+            } catch (err) {
+                errors.push({
+                    recipient,
+                    error: err.message,
+                    index: i
+                });
+                
+                // Continue with next recipient even if one fails
+                continue;
+            }
+        }
+
+        res.json({
+            success: true,
+            results: {
+                total: recipients.length,
+                successful: results.length,
+                failed: errors.length,
+                details: {
+                    successes: results,
+                    errors: errors
+                }
+            }
+        });
+
+    } catch (err) {
+        res.status(500).json({ 
+            error: err.message,
+            partial_results: {
+                successes: results,
+                errors: errors
+            }
+        });
     }
 });
 
