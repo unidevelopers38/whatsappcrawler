@@ -396,7 +396,7 @@ app.post('/message/send', async (req, res) => {
     if (!client || client.status !== 'ready') return res.status(400).json({ error: "Client not ready" });
 
     try {
-        await client.sendMessage(to, message);
+        await client.sendMessage(to+ '@c.us', message);
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
