@@ -54,13 +54,16 @@ const initializeClient = async (clientId) => {
             headless: true,
             args: ['--no-sandbox', '--disable-setuid-sandbox'] 
         },
-        // Add restartOnAuthFail to handle authentication issues
-        restartOnAuthFail: true
+        restartOnAuthFail: true,
+        logger: console
     });
 
     client.status = 'initializing';
     client.qr = null;
     client.clientId = clientId;
+    client.isStable = false;
+    client.readyForOperations = false;
+    client.loadingCompleted = false;
 
     client.on('qr', (qr) => {
         console.log(`QR received for client ${clientId}`);
@@ -73,10 +76,28 @@ const initializeClient = async (clientId) => {
         console.log(`Client ${clientId} is ready!`);
         client.status = 'ready';
         client.qr = null;
-        client.emit('status_change', { status: 'ready' });
         
-        // Save session info to a file for persistence across restarts
-        saveClientInfo(clientId);
+        // Check if loading already completed
+        if (client.loadingCompleted) {
+            console.log(`Client ${clientId} was already loaded, marking as STABLE immediately`);
+            client.isStable = true;
+            client.readyForOperations = true;
+            saveClientInfo(clientId);
+        } else {
+            console.log(`Client ${clientId} marked as ready, waiting for stable state...`);
+            
+            // Fallback: If loading doesn't complete in 3 seconds, mark as stable anyway
+            setTimeout(() => {
+                if (!client.isStable && client.status === 'ready') {
+                    console.log(`Client ${clientId} fallback: marking as STABLE after timeout`);
+                    client.isStable = true;
+                    client.readyForOperations = true;
+                    saveClientInfo(clientId);
+                }
+            }, 3000);
+        }
+        
+        client.emit('status_change', { status: 'ready' });
     });
 
     client.on('authenticated', () => {
@@ -88,12 +109,14 @@ const initializeClient = async (clientId) => {
     client.on('auth_failure', (msg) => {
         console.error(`Authentication failed for client ${clientId}:`, msg);
         client.status = 'auth_failure';
+        client.isStable = false;
         client.emit('status_change', { status: 'auth_failure' });
     });
 
     client.on('disconnected', (reason) => {
         console.log(`Client ${clientId} disconnected:`, reason);
         client.status = 'disconnected';
+        client.isStable = false;
         client.emit('status_change', { status: 'disconnected' });
         
         // Clean up
@@ -107,7 +130,21 @@ const initializeClient = async (clientId) => {
 
     client.on('loading_screen', (percent, message) => {
         console.log(`Client ${clientId} loading: ${percent}% - ${message}`);
-        client.status = 'loading';
+        
+        // Track if loading reached 100%
+        if (percent >= 100) {
+            client.loadingCompleted = true;
+            
+            // If status is already 'ready', mark as stable immediately
+            if (client.status === 'ready' && !client.isStable) {
+                console.log(`Client ${clientId} loading complete, marking as STABLE`);
+                client.isStable = true;
+                client.readyForOperations = true;
+                client.emit('status_change', { status: 'stable' });
+                saveClientInfo(clientId);
+            }
+        }
+        
         client.emit('status_change', { status: 'loading', percent, message });
     });
 
@@ -119,6 +156,7 @@ const initializeClient = async (clientId) => {
     } catch (error) {
         console.error(`Failed to initialize client ${clientId}:`, error);
         client.status = 'error';
+        client.isStable = false;
         client.error = error.message;
         throw error;
     }
@@ -141,7 +179,8 @@ const saveClientInfo = (clientId) => {
     
     clientInfo[clientId] = {
         lastReady: new Date().toISOString(),
-        status: 'ready'
+        status: 'ready',
+        isStable: true
     };
     
     try {
@@ -174,7 +213,10 @@ const initializeExistingSessions = async () => {
 app.get('/health', (req, res) => {
     const activeClients = Object.keys(clients).length;
     const clientStatuses = Object.entries(clients).reduce((acc, [id, client]) => {
-        acc[id] = client.status;
+        acc[id] = {
+            status: client.status,
+            isStable: client.isStable || false
+        };
         return acc;
     }, {});
     
@@ -183,6 +225,30 @@ app.get('/health', (req, res) => {
         activeClients,
         clientStatuses,
         uptime: process.uptime()
+    });
+});
+
+// Stability check endpoint
+app.get('/session/stability/:clientId', (req, res) => {
+    const client = clients[req.params.clientId];
+    if (!client) {
+        // Check if session exists on disk but not in memory
+        const sessionPath = path.join(SESSIONS_DIR, req.params.clientId);
+        if (fs.existsSync(sessionPath)) {
+            return res.json({
+                status: 'disconnected',
+                isStable: false,
+                readyForOperations: false,
+                message: "Session exists on disk but not loaded in memory"
+            });
+        }
+        return res.status(404).json({ message: "Session not found" });
+    }
+    
+    res.json({
+        status: client.status,
+        isStable: client.isStable || false,
+        readyForOperations: client.status === 'ready' && client.isStable === true
     });
 });
 
@@ -199,6 +265,7 @@ app.post('/session/start', async (req, res) => {
             return res.json({ 
                 message: "Client already exists", 
                 status: existingClient.status,
+                isStable: existingClient.isStable || false,
                 clientId 
             });
         }
@@ -207,6 +274,7 @@ app.post('/session/start', async (req, res) => {
         res.json({ 
             message: "Initializing...", 
             status: client.status,
+            isStable: client.isStable || false,
             clientId 
         });
     } catch (error) {
@@ -224,6 +292,7 @@ app.get('/session/status/:clientId', (req, res) => {
         if (fs.existsSync(sessionPath)) {
             return res.json({
                 status: 'disconnected',
+                isStable: false,
                 message: "Session exists on disk but not loaded in memory. Use /session/start to reload."
             });
         }
@@ -232,8 +301,10 @@ app.get('/session/status/:clientId', (req, res) => {
     
     res.json({
         status: client.status,
+        isStable: client.isStable || false,
         qr: client.qr,
-        clientId: client.clientId
+        clientId: client.clientId,
+        readyForOperations: client.status === 'ready' && client.isStable === true
     });
 });
 
@@ -242,7 +313,9 @@ app.get('/sessions', (req, res) => {
     const sessions = Object.entries(clients).map(([clientId, client]) => ({
         clientId,
         status: client.status,
-        hasQr: !!client.qr
+        isStable: client.isStable || false,
+        hasQr: !!client.qr,
+        readyForOperations: client.status === 'ready' && client.isStable === true
     }));
     
     res.json({
@@ -251,10 +324,23 @@ app.get('/sessions', (req, res) => {
     });
 });
 
+// Helper function to check if client is ready and stable
+const isClientReady = (client) => {
+    return client && 
+           client.status === 'ready' && 
+           client.isStable === true &&
+           client.readyForOperations === true;
+};
+
+
 // 4. Get All Contacts & Groups
 app.get('/contacts/:clientId', async (req, res) => {
     const client = clients[req.params.clientId];
-    if (!client || client.status !== 'ready') return res.status(400).json({ error: "Client not ready" });
+    if (!isClientReady(client)) {
+        return res.status(400).json({ 
+            error: "Client not ready or still initializing. Please wait." 
+        });
+    }
 
     try {
         const contacts = await client.getContacts();
@@ -273,7 +359,11 @@ app.get('/contacts/:clientId', async (req, res) => {
 // 5. Get All Chats
 app.get('/chats/:clientId', async (req, res) => {
     const client = clients[req.params.clientId];
-    if (!client || client.status !== 'ready') return res.status(400).json({ error: "Client not ready" });
+    if (!isClientReady(client)) {
+        return res.status(400).json({ 
+            error: "Client not ready or still initializing. Please wait." 
+        });
+    }
 
     try {
         const chats = await client.getChats();
@@ -345,13 +435,18 @@ app.get('/chats/:clientId', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+
 // 6. Get Messages for a Specific Chat
 app.get('/chats/:clientId/:chatId/messages', async (req, res) => {
     const { clientId, chatId } = req.params;
     const { limit = 50 } = req.query;
     
     const client = clients[clientId];
-    if (!client || client.status !== 'ready') return res.status(400).json({ error: "Client not ready" });
+    if (!isClientReady(client)) {
+        return res.status(400).json({ 
+            error: "Client not ready or still initializing. Please wait." 
+        });
+    }
 
     try {
         const chat = await client.getChatById(chatId);
@@ -393,12 +488,33 @@ app.post('/message/send', async (req, res) => {
     const { clientId, to, message } = req.body;
     const client = clients[clientId];
 
-    if (!client || client.status !== 'ready') return res.status(400).json({ error: "Client not ready" });
+    if (!isClientReady(client)) {
+        return res.status(400).json({ 
+            error: "Client not ready or still initializing. Please wait." 
+        });
+    }
+
+    // Validate message is not empty
+    if (!message || typeof message !== 'string' || message.trim().length === 0) {
+        return res.status(400).json({ 
+            error: "Message body cannot be empty. Please provide valid text to send." 
+        });
+    }
+
+    // Validate recipient field
+    if (!to || typeof to !== 'string' || to.trim().length === 0) {
+        return res.status(400).json({ 
+            error: "Recipient ('to') field cannot be empty." 
+        });
+    }
 
     try {
-        await client.sendMessage(to+ '@c.us', message);
+        // Ensure proper formatting of recipient ID
+        const formattedTo = to.includes('@') ? to : `${to}@c.us`;
+        await client.sendMessage(formattedTo, message);
         res.json({ success: true });
     } catch (err) {
+        console.error('Error sending message:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -409,12 +525,24 @@ app.post('/chats/:clientId/:chatId/send', async (req, res) => {
     const { message } = req.body;
     
     const client = clients[clientId];
-    if (!client || client.status !== 'ready') return res.status(400).json({ error: "Client not ready" });
+    if (!isClientReady(client)) {
+        return res.status(400).json({ 
+            error: "Client not ready or still initializing. Please wait." 
+        });
+    }
+
+    // Validate message is not empty
+    if (!message || typeof message !== 'string' || message.trim().length === 0) {
+        return res.status(400).json({ 
+            error: "Message body cannot be empty. Please provide valid text to send." 
+        });
+    }
 
     try {
         await client.sendMessage(chatId, message);
         res.json({ success: true, chatId });
     } catch (err) {
+        console.error('Error sending message to chat:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -424,12 +552,21 @@ app.post('/message/send-bulk', async (req, res) => {
     const { clientId, recipients, message, delay = 0 } = req.body;
     const client = clients[clientId];
 
-    if (!client || client.status !== 'ready') {
-        return res.status(400).json({ error: "Client not ready" });
+    if (!isClientReady(client)) {
+        return res.status(400).json({ 
+            error: "Client not ready or still initializing. Please wait." 
+        });
     }
 
     if (!Array.isArray(recipients) || recipients.length === 0) {
         return res.status(400).json({ error: "Invalid recipients array" });
+    }
+
+    // Validate message is not empty
+    if (!message || typeof message !== 'string' || message.trim().length === 0) {
+        return res.status(400).json({ 
+            error: "Message body cannot be empty. Please provide valid text to send." 
+        });
     }
 
     const results = [];
@@ -440,8 +577,9 @@ app.post('/message/send-bulk', async (req, res) => {
             const recipient = recipients[i];
             
             try {
-                // Send message
-                await client.sendMessage(recipient, message);
+                // Ensure proper formatting of recipient ID
+                const formattedRecipient = recipient.includes('@') ? recipient : `${recipient}@c.us`;
+                await client.sendMessage(formattedRecipient, message);
                 results.push({
                     recipient,
                     status: 'success',
