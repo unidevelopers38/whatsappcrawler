@@ -2,6 +2,8 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const { v4: uuidv4 } = require('uuid');
+const csv = require('csv-writer').createObjectCsvWriter;
 const app = express();
 const port = 3000;
 
@@ -10,8 +12,17 @@ app.use(express.json());
 // Store active clients in memory
 const clients = {};
 
+// Store export jobs in memory
+const exportJobs = {};
+
 // Define the sessions directory (where LocalAuth stores session data)
 const SESSIONS_DIR = path.join(__dirname, '.wwebjs_auth');
+const EXPORTS_DIR = path.join(__dirname, 'exports');
+
+// Create exports directory if it doesn't exist
+if (!fs.existsSync(EXPORTS_DIR)) {
+    fs.mkdirSync(EXPORTS_DIR, { recursive: true });
+}
 
 // Function to discover existing sessions
 const discoverExistingSessions = () => {
@@ -209,6 +220,277 @@ const initializeExistingSessions = async () => {
     console.log('Session initialization complete');
 };
 
+// Background job processor function
+const processContactExport = async (jobId, clientId) => {
+    const client = clients[clientId];
+    
+    if (!client || !isClientReady(client)) {
+        exportJobs[jobId].status = 'failed';
+        exportJobs[jobId].error = 'Client not ready';
+        exportJobs[jobId].completedAt = new Date().toISOString();
+        return;
+    }
+    
+    try {
+        console.log(`🚀 Starting background contact export job ${jobId} for client ${clientId}...`);
+        exportJobs[jobId].status = 'processing';
+        exportJobs[jobId].startedAt = new Date().toISOString();
+        console.time(`export-${jobId}`);
+        
+        // Step 1: Get all chats (individual and groups)
+        console.log(`📋 [Job ${jobId}] Step 1: Fetching all chats...`);
+        exportJobs[jobId].progress = 'Fetching chats...';
+        const chats = await client.getChats();
+        console.log(`✅ [Job ${jobId}] Found ${chats.length} total chats`);
+        
+        // Separate individual chats from groups
+        const individualChats = chats.filter(chat => !chat.isGroup);
+        const groups = chats.filter(chat => chat.isGroup);
+        
+        console.log(`   💬 [Job ${jobId}] Individual chats: ${individualChats.length}`);
+        console.log(`   👥 [Job ${jobId}] Groups: ${groups.length}`);
+        
+        // Step 2: Extract unique contacts from individual chats
+        console.log(`📋 [Job ${jobId}] Step 2: Extracting contacts from individual chats...`);
+        const individualContactsMap = new Map();
+        let processedIndividualChats = 0;
+        
+        for (const chat of individualChats) {
+            processedIndividualChats++;
+            
+            try {
+                const contactId = chat.id._serialized;
+                const phoneNumber = chat.id.user || '';
+                
+                if (!individualContactsMap.has(contactId)) {
+                    individualContactsMap.set(contactId, {
+                        id: contactId,
+                        name: chat.name || '',
+                        number: phoneNumber,
+                        isGroupContact: false,
+                        sourceGroups: [],
+                        sourceType: 'individual_chat',
+                        isMyContact: true,
+                        extractedAt: new Date().toISOString()
+                    });
+                }
+                
+                if (processedIndividualChats % 50 === 0 || processedIndividualChats === individualChats.length) {
+                    exportJobs[jobId].progress = `Processed ${processedIndividualChats}/${individualChats.length} individual chats`;
+                    console.log(`   📊 [Job ${jobId}] ${exportJobs[jobId].progress}`);
+                }
+                
+            } catch (chatError) {
+                console.error(`   ❌ [Job ${jobId}] Error processing individual chat:`, chatError.message);
+                continue;
+            }
+        }
+        
+        console.log(`✅ [Job ${jobId}] Extracted ${individualContactsMap.size} unique contacts from individual chats`);
+        
+        // Step 3: Extract unique contacts from groups
+        console.log(`📋 [Job ${jobId}] Step 3: Extracting contacts from groups...`);
+        const groupContactsMap = new Map();
+        let processedGroups = 0;
+        let totalGroupMembers = 0;
+        
+        for (const group of groups) {
+            processedGroups++;
+            const groupName = group.name || group.id.user;
+            
+            try {
+                const participants = group.participants || [];
+                
+                for (const participant of participants) {
+                    const contactId = participant.id._serialized;
+                    const phoneNumber = participant.id.user;
+                    
+                    if (!groupContactsMap.has(contactId)) {
+                        groupContactsMap.set(contactId, {
+                            id: contactId,
+                            name: participant.name || participant.pushname || '',
+                            number: phoneNumber,
+                            isGroupContact: true,
+                            sourceGroups: [groupName],
+                            sourceType: 'group',
+                            isMyContact: false,
+                            extractedAt: new Date().toISOString()
+                        });
+                    } else {
+                        const existingContact = groupContactsMap.get(contactId);
+                        if (!existingContact.sourceGroups.includes(groupName)) {
+                            existingContact.sourceGroups.push(groupName);
+                        }
+                    }
+                    totalGroupMembers++;
+                }
+                
+                if (processedGroups % 10 === 0 || processedGroups === groups.length) {
+                    exportJobs[jobId].progress = `Processed ${processedGroups}/${groups.length} groups`;
+                    console.log(`   📊 [Job ${jobId}] ${exportJobs[jobId].progress}`);
+                }
+                
+            } catch (groupError) {
+                console.error(`❌ [Job ${jobId}] Error processing group "${groupName}":`, groupError.message);
+                continue;
+            }
+        }
+        
+        console.log(`✅ [Job ${jobId}] Extracted ${groupContactsMap.size} unique contacts from groups`);
+        
+        // Step 4: Generate random names for contacts without names
+        console.log(`📋 [Job ${jobId}] Step 4: Generating names for unnamed contacts...`);
+        exportJobs[jobId].progress = 'Generating names for contacts...';
+        const firstNames = ['John', 'Jane', 'Alex', 'Emma', 'Chris', 'Sarah', 'Mike', 'Lisa', 'David', 'Anna'];
+        const lastNames = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Rodriguez', 'Martinez'];
+        
+        const generateRandomName = (phoneNumber) => {
+            const firstName = firstNames[Math.floor(Math.random() * firstNames.length)];
+            const lastName = lastNames[Math.floor(Math.random() * lastNames.length)];
+            return `${firstName} ${lastName}`;
+        };
+        
+        // Step 5: Combine all contacts
+        console.log(`📋 [Job ${jobId}] Step 5: Combining and deduplicating all contacts...`);
+        exportJobs[jobId].progress = 'Combining and deduplicating contacts...';
+        const allContactsMap = new Map();
+        let unnamedCount = 0;
+        
+        // Add individual contacts first
+        for (const [contactId, contact] of individualContactsMap) {
+            let contactName = contact.name;
+            if (!contactName.trim()) {
+                contactName = generateRandomName(contact.number);
+                unnamedCount++;
+            }
+            allContactsMap.set(contactId, { ...contact, name: contactName });
+        }
+        
+        // Add group contacts
+        let newGroupContacts = 0;
+        let mergedGroupContacts = 0;
+        
+        for (const [contactId, groupContact] of groupContactsMap) {
+            if (!allContactsMap.has(contactId)) {
+                let contactName = groupContact.name;
+                if (!contactName.trim()) {
+                    contactName = generateRandomName(groupContact.number);
+                    unnamedCount++;
+                }
+                allContactsMap.set(contactId, { ...groupContact, name: contactName });
+                newGroupContacts++;
+            } else {
+                const existingContact = allContactsMap.get(contactId);
+                existingContact.isGroupContact = true;
+                existingContact.sourceType = 'both';
+                groupContact.sourceGroups.forEach(group => {
+                    if (!existingContact.sourceGroups.includes(group)) {
+                        existingContact.sourceGroups.push(group);
+                    }
+                });
+                existingContact.sourceGroups.sort();
+                mergedGroupContacts++;
+            }
+        }
+        
+        const allContacts = Array.from(allContactsMap.values());
+        
+        console.log(`📊 [Job ${jobId}] Final: ${allContacts.length} total contacts`);
+        
+        // Step 6: Create CSV file
+        console.log(`📋 [Job ${jobId}] Step 6: Creating CSV file...`);
+        exportJobs[jobId].progress = 'Creating CSV file...';
+        
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const filename = `whatsapp-contacts-${clientId}-${timestamp}.csv`;
+        const filepath = path.join(EXPORTS_DIR, filename);
+        
+        const csvWriter = csv({
+            path: filepath,
+            header: [
+                { id: 'name', title: 'Name' },
+                { id: 'number', title: 'Phone Number' },
+                { id: 'type', title: 'Type' },
+                { id: 'groups', title: 'Groups' },
+                { id: 'source', title: 'Source' },
+                { id: 'extractedAt', title: 'Extracted At' }
+            ],
+            fieldDelimiter: ',',
+            recordDelimiter: '\n',
+            alwaysQuote: true
+        });
+        
+        const csvData = allContacts.map(contact => {
+            let source = contact.sourceType;
+            if (source === 'both') source = 'individual_chat_and_group';
+            
+            let groupsFormatted = '[]';
+            if (contact.sourceGroups.length > 0) {
+                const escapedGroups = contact.sourceGroups.map(group => JSON.stringify(group));
+                groupsFormatted = `[${escapedGroups.join(', ')}]`;
+            }
+            
+            return {
+                name: contact.name,
+                number: contact.number,
+                type: 'Contact',
+                groups: groupsFormatted,
+                source: source,
+                extractedAt: contact.extractedAt
+            };
+        });
+        
+        await csvWriter.writeRecords(csvData);
+        const fileSize = fs.statSync(filepath).size;
+        const fileSizeMB = (fileSize / (1024 * 1024)).toFixed(2);
+        
+        console.timeEnd(`export-${jobId}`);
+        console.log(`✅ [Job ${jobId}] CSV file created: ${filename} (${fileSizeMB} MB)`);
+        
+        // Update job status
+        exportJobs[jobId].status = 'completed';
+        exportJobs[jobId].result = {
+            filename: filename,
+            filepath: filepath,
+            url: `/exports/${filename}`,
+            size: fileSize,
+            sizeFormatted: `${fileSizeMB} MB`
+        };
+        exportJobs[jobId].summary = {
+            totalContacts: allContacts.length,
+            withGeneratedNames: unnamedCount,
+            fromIndividualChats: individualContactsMap.size - mergedGroupContacts,
+            fromGroups: newGroupContacts + mergedGroupContacts,
+            groupsProcessed: groups.length,
+            individualChatsProcessed: individualChats.length,
+            duplicatesMerged: mergedGroupContacts
+        };
+        exportJobs[jobId].completedAt = new Date().toISOString();
+        
+        // Auto-cleanup: Remove job after 1 hour
+        setTimeout(() => {
+            if (exportJobs[jobId]) {
+                delete exportJobs[jobId];
+                console.log(`🧹 Cleaned up job ${jobId} from memory`);
+            }
+        }, 60 * 60 * 1000);
+        
+    } catch (err) {
+        console.error(`❌ [Job ${jobId}] Error in background job:`, err);
+        exportJobs[jobId].status = 'failed';
+        exportJobs[jobId].error = err.message;
+        exportJobs[jobId].completedAt = new Date().toISOString();
+    }
+};
+
+// Helper function to check if client is ready and stable
+const isClientReady = (client) => {
+    return client && 
+           client.status === 'ready' && 
+           client.isStable === true &&
+           client.readyForOperations === true;
+};
+
 // Health check endpoint
 app.get('/health', (req, res) => {
     const activeClients = Object.keys(clients).length;
@@ -324,16 +606,7 @@ app.get('/sessions', (req, res) => {
     });
 });
 
-// Helper function to check if client is ready and stable
-const isClientReady = (client) => {
-    return client && 
-           client.status === 'ready' && 
-           client.isStable === true &&
-           client.readyForOperations === true;
-};
-
-
-// 4. Get All Contacts & Groups
+// 4. Get All Contacts & Groups (Note: May fail due to library issue)
 app.get('/contacts/:clientId', async (req, res) => {
     const client = clients[req.params.clientId];
     if (!isClientReady(client)) {
@@ -547,7 +820,7 @@ app.post('/chats/:clientId/:chatId/send', async (req, res) => {
     }
 });
 
-// Add this endpoint to your Node.js service
+// 9. Send Bulk Messages
 app.post('/message/send-bulk', async (req, res) => {
     const { clientId, recipients, message, delay = 0 } = req.body;
     const client = clients[clientId];
@@ -627,7 +900,184 @@ app.post('/message/send-bulk', async (req, res) => {
     }
 });
 
-// 9. Delete Session (Logout)
+// 10. Start Contact Export (Background Job)
+app.post('/contacts/export/csv/:clientId', async (req, res) => {
+    const client = clients[req.params.clientId];
+    if (!isClientReady(client)) {
+        return res.status(400).json({ 
+            error: "Client not ready or still initializing. Please wait." 
+        });
+    }
+
+    // Create a job ID
+    const jobId = uuidv4();
+    
+    // Initialize job
+    exportJobs[jobId] = {
+        id: jobId,
+        clientId: req.params.clientId,
+        status: 'queued',
+        createdAt: new Date().toISOString(),
+        progress: 'Waiting to start...'
+    };
+    
+    // Start the background job immediately (non-blocking)
+    processContactExport(jobId, req.params.clientId);
+    
+    // Return job info immediately
+    res.json({
+        success: true,
+        message: "Contact export started in background",
+        job: {
+            id: jobId,
+            status: 'queued',
+            createdAt: exportJobs[jobId].createdAt,
+            checkStatusUrl: `/jobs/${jobId}`,
+            clientId: req.params.clientId
+        }
+    });
+});
+
+// 11. Check Job Status
+app.get('/jobs/:jobId', (req, res) => {
+    const job = exportJobs[req.params.jobId];
+    
+    if (!job) {
+        return res.status(404).json({ 
+            error: "Job not found. It may have been completed and cleaned up." 
+        });
+    }
+    
+    res.json({
+        job: {
+            id: job.id,
+            clientId: job.clientId,
+            status: job.status,
+            createdAt: job.createdAt,
+            startedAt: job.startedAt,
+            completedAt: job.completedAt,
+            progress: job.progress || 'Unknown',
+            result: job.result,
+            summary: job.summary,
+            error: job.error
+        }
+    });
+});
+
+// 12. List All Active Jobs
+app.get('/jobs', (req, res) => {
+    const jobs = Object.values(exportJobs).map(job => ({
+        id: job.id,
+        clientId: job.clientId,
+        status: job.status,
+        createdAt: job.createdAt,
+        progress: job.progress
+    }));
+    
+    res.json({
+        total: jobs.length,
+        jobs: jobs
+    });
+});
+
+// 13. Cancel Job
+app.delete('/jobs/:jobId', (req, res) => {
+    const job = exportJobs[req.params.jobId];
+    
+    if (!job) {
+        return res.status(404).json({ 
+            error: "Job not found" 
+        });
+    }
+    
+    if (job.status === 'processing') {
+        // Note: We can't actually stop the processing, but we can mark it
+        job.status = 'cancelled';
+        job.completedAt = new Date().toISOString();
+    } else if (job.status === 'queued') {
+        job.status = 'cancelled';
+        job.completedAt = new Date().toISOString();
+    }
+    
+    res.json({
+        success: true,
+        message: `Job ${req.params.jobId} cancelled`,
+        job: {
+            id: job.id,
+            status: job.status,
+            cancelledAt: job.completedAt
+        }
+    });
+});
+
+// 14. Download exported CSV file
+app.get('/exports/:filename', (req, res) => {
+    const filename = req.params.filename;
+    const filepath = path.join(EXPORTS_DIR, filename);
+    
+    if (!fs.existsSync(filepath)) {
+        return res.status(404).json({ error: "File not found" });
+    }
+    
+    res.download(filepath, filename, (err) => {
+        if (err) {
+            console.error('Error downloading file:', err);
+            if (!res.headersSent) {
+                res.status(500).json({ error: "Error downloading file" });
+            }
+        }
+    });
+});
+
+// 15. List all exported files
+app.get('/exports', (req, res) => {
+    if (!fs.existsSync(EXPORTS_DIR)) {
+        return res.json({ files: [], total: 0 });
+    }
+    
+    const files = fs.readdirSync(EXPORTS_DIR)
+        .filter(file => file.endsWith('.csv'))
+        .map(file => {
+            const filepath = path.join(EXPORTS_DIR, file);
+            const stats = fs.statSync(filepath);
+            return {
+                filename: file,
+                size: stats.size,
+                created: stats.birthtime,
+                modified: stats.mtime,
+                downloadUrl: `/exports/${file}`
+            };
+        })
+        .sort((a, b) => new Date(b.created) - new Date(a.created));
+    
+    res.json({
+        files: files,
+        total: files.length
+    });
+});
+
+// 16. Delete exported file
+app.delete('/exports/:filename', (req, res) => {
+    const filename = req.params.filename;
+    const filepath = path.join(EXPORTS_DIR, filename);
+    
+    if (!fs.existsSync(filepath)) {
+        return res.status(404).json({ error: "File not found" });
+    }
+    
+    try {
+        fs.unlinkSync(filepath);
+        res.json({ 
+            success: true, 
+            message: `File ${filename} deleted successfully` 
+        });
+    } catch (err) {
+        console.error('Error deleting file:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 17. Delete Session (Logout)
 app.delete('/session/:clientId', async (req, res) => {
     const client = clients[req.params.clientId];
     if (client) {
@@ -666,6 +1116,40 @@ app.delete('/session/:clientId', async (req, res) => {
         res.status(404).json({ message: "Session not found" });
     }
 });
+
+// Function to clean old export files
+const cleanupOldExports = (maxAgeHours = 24) => {
+    if (!fs.existsSync(EXPORTS_DIR)) return;
+    
+    const files = fs.readdirSync(EXPORTS_DIR);
+    const now = Date.now();
+    const maxAge = maxAgeHours * 60 * 60 * 1000;
+    let deletedCount = 0;
+    
+    files.forEach(file => {
+        const filepath = path.join(EXPORTS_DIR, file);
+        try {
+            const stats = fs.statSync(filepath);
+            const fileAge = now - stats.mtimeMs;
+            
+            if (fileAge > maxAge) {
+                fs.unlinkSync(filepath);
+                deletedCount++;
+                console.log(`Cleaned up old export: ${file}`);
+            }
+        } catch (err) {
+            console.error(`Error cleaning up ${file}:`, err.message);
+        }
+    });
+    
+    if (deletedCount > 0) {
+        console.log(`Cleaned up ${deletedCount} old export files`);
+    }
+};
+
+// Run cleanup on server start and periodically
+setInterval(() => cleanupOldExports(24), 60 * 60 * 1000); // Every hour
+cleanupOldExports(24); // Run on startup
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
