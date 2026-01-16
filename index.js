@@ -757,37 +757,44 @@ app.get('/chats/:clientId/:chatId/messages', async (req, res) => {
 });
 
 // 7. Send Message
+const { Poll } = require('whatsapp-web.js');
 app.post('/message/send', async (req, res) => {
-    const { clientId, to, message } = req.body;
+    const { clientId, to, message, poll } = req.body;
     const client = clients[clientId];
-
-    if (!isClientReady(client)) {
-        return res.status(400).json({ 
-            error: "Client not ready or still initializing. Please wait." 
-        });
-    }
-
-    // Validate message is not empty
-    if (!message || typeof message !== 'string' || message.trim().length === 0) {
-        return res.status(400).json({ 
-            error: "Message body cannot be empty. Please provide valid text to send." 
-        });
-    }
-
-    // Validate recipient field
-    if (!to || typeof to !== 'string' || to.trim().length === 0) {
-        return res.status(400).json({ 
-            error: "Recipient ('to') field cannot be empty." 
-        });
-    }
+    
+    console.log("Received Poll Data:", poll);
 
     try {
-        // Ensure proper formatting of recipient ID
-        const formattedTo = to.includes('@') ? to : `${to}@c.us`;
-        await client.sendMessage(formattedTo, message);
+        if (poll && poll.options) {
+            let pollOptions = poll.options;
+
+            // FIX: If Laravel sent a string, turn it into a real Array
+            if (typeof pollOptions === 'string') {
+                try {
+                    pollOptions = JSON.parse(pollOptions);
+                } catch (e) {
+                    console.error("Failed to parse poll options string:", e);
+                    // Fallback: maybe it's comma-separated? Or just wrap in array.
+                    pollOptions = [pollOptions]; 
+                }
+            }
+
+            // Standardize the address
+            const formattedTo = to.includes('@') ? to : `${to}@c.us`;
+
+            // Create the Poll object
+            const pollObject = new Poll(message, pollOptions, { allowMultipleAnswers: false });
+            
+            await client.sendMessage(formattedTo, pollObject);
+        } else {
+            // Normal message logic
+            const formattedTo = to.includes('@') ? to : `${to}@c.us`;
+            await client.sendMessage(formattedTo, message);
+        }
+
         res.json({ success: true });
     } catch (err) {
-        console.error('Error sending message:', err);
+        console.error('Error in send route:', err);
         res.status(500).json({ error: err.message });
     }
 });
