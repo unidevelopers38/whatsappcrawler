@@ -6,7 +6,7 @@ const { v4: uuidv4 } = require('uuid');
 const csv = require('csv-writer').createObjectCsvWriter;
 const app = express();
 const port = 3000;
-
+const axios = require('axios');
 app.use(express.json());
 
 // Store active clients in memory
@@ -157,6 +157,46 @@ const initializeClient = async (clientId) => {
         }
         
         client.emit('status_change', { status: 'loading', percent, message });
+    });
+
+    // Listen for poll votes
+    client.on('vote_update', async (vote) => {
+        const selection = vote.selectedOptions[0]?.name;
+        const voterId = vote.voter;
+
+        if (!selection) return; // User deselected
+
+        
+        // 2. IMMEDIATE INTERACTION: Provide the info they asked for
+        if (selection === 'Join VIP Community 👥') {
+            await client.sendMessage(voterId, 
+                "✅ *Access Granted!*\n\nWelcome to the ViralFactory inner circle. Join the tribe of elite creators and sellers here:\n\n👉 https://chat.whatsapp.com/DwtNVXqCMfiKGzyWhXpofH?mode=wwt"
+            );
+        } 
+        else if (selection.includes('View Prices') || selection.includes('View Catalog')) {
+            await client.sendMessage(voterId, 
+                "📊 *ViralFactory Price List & Catalog*\n\nCheck out our latest rates for Aged Accounts, SMM Services, and Virtual SMS numbers on our official channel:\n\n👉 https://whatsapp.com/channel/0029VbBew6729754VOdMFs3p"
+            );
+        }
+        else if (selection.includes('Talk to an Expert')) {
+            await client.sendMessage(voterId, 
+                "🤝 *Expert Support*\n\nOne of our lead growth strategists is ready to assist you. Click the link below to start a direct chat:\n\n👉 https://wa.me/15793322127\n\n_Note: Mention your specific interest (SMS, Accounts, or SMM) for faster service!_"
+            );
+        }
+
+        try {
+            // 1. Send data to Laravel for your Dashboard statistics
+            await axios.post('http://localhost:8000/api/webhooks/whatsapp/poll-vote', {
+                from: vote.voter.split('@')[0], // The user's phone number
+                poll_id: vote.parentMessage.id._serialized, // Unique ID of the poll message
+                selected_options: vote.selectedOptions.map(opt => opt.name), // Just the names: ["Join VIP Community 👥"]
+                timestamp: vote.interractedAtTs
+            });
+        }catch (error) {
+            console.log("axios failed")
+            console.log(error)
+        }
+        
     });
 
     try {
